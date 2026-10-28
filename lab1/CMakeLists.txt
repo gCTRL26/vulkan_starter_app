@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
-project(cg-lab1 LANGUAGES C CXX)
+project(cg-lab2 LANGUAGES C CXX)
 
 add_executable(${PROJECT_NAME}
 	source/main.cpp
@@ -113,6 +113,8 @@ endmacro()
 
 compile_shader(scene.vert)
 compile_shader(scene.frag)
+compile_shader(lines.vert)
+compile_shader(lines.frag)
 
 add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
 add_dependencies(${PROJECT_NAME} shaders)

@@ -1,31 +1,36 @@
 #version 450 core
 
 layout(location = 0) in vec3 in_position;
-layout(location = 1) in vec3 in_color;
+layout(location = 1) in vec3 in_normal;
+layout(location = 2) in vec3 in_color;
 
-layout(location = 0) out vec3 out_color;
+layout(location = 0) out vec3 out_position;
+layout(location = 1) out vec3 out_normal;
+layout(location = 2) out vec3 out_color;
 
-layout(std140, set = 0, binding = 0) uniform GlobalUniforms {
-	mat4 view;
-	mat4 projection;
-} global_uniforms;
+layout(std140, set = 0, binding = 0) uniform SceneUniforms {
+	mat4 view_projection;
+	vec3 camera_position;
+	vec3 directional_light_direction;
+	vec3 directional_light_color;
+	vec3 ambient_light;
+	uint point_light_count;
+	uint spot_light_count;
+} scene_uniforms;
 
-layout(std140, set = 1, binding = 0) uniform ObjectUniforms {
+layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	mat4 model;
-	vec4 color;
+	vec3 albedo;
+	vec3 specular;
+	float alpha;
 	float use_vertex_colors;
-} object_uniforms;
-
-layout(push_constant) uniform PushConstants {
-	vec4 override_color;
-} push_constants;
+} model_uniforms;
 
 void main() {
-	gl_Position = global_uniforms.projection * global_uniforms.view *
-	              object_uniforms.model * vec4(in_position, 1.0);
+	vec4 position = model_uniforms.model * vec4(in_position, 1.0);
+	gl_Position = scene_uniforms.view_projection * position;
 
-	vec3 vertex_color = mix(vec3(1.0), in_color, object_uniforms.use_vertex_colors);
-	vec3 color = object_uniforms.color.rgb * vertex_color;
-
-	out_color = mix(color, push_constants.override_color.rgb, push_constants.override_color.a);
+	out_position = position.xyz;
+	out_normal = transpose(inverse(mat3(model_uniforms.model))) * in_normal;
+	out_color = mix(vec3(1.0), in_color, model_uniforms.use_vertex_colors);
 }

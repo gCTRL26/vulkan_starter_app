@@ -7,6 +7,7 @@
 
 struct Vertex {
 	math::Vector3 position;
+	math::Vector3 normal;
 	math::Vector3 color;
 };
 
@@ -30,6 +31,7 @@ struct Mesh {
 	std::vector<Vertex> vertices;
 	std::vector<uint32_t> triangles;
 	std::vector<uint32_t> edges;
+	uint32_t corner_count;
 	uint32_t face_count;
 };
 

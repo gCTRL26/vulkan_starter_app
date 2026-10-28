@@ -20,24 +20,63 @@ namespace {
 
 using graphics::internal::context;
 
-struct GlobalUniforms {
-	math::Matrix4 view;
-	math::Matrix4 projection;
+struct SceneUniforms {
+	math::Matrix4 view_projection;
+	float camera_position[3];
+	float padding0;
+	float directional_light_direction[3];
+	float padding1;
+	float directional_light_color[3];
+	float padding2;
+	float ambient_light[3];
+	uint32_t point_light_count;
+	uint32_t spot_light_count;
+	float padding3[3];
 };
 
-struct ObjectUniforms {
+struct ModelUniform {
 	math::Matrix4 model;
-	float color[4];
+	float albedo[3];
+	float padding0;
+	float specular[3];
+	float alpha;
 	float use_vertex_colors;
-	float padding[3];
+	float padding1[3];
+};
+
+struct PointLightData {
+	float position[3];
+	float padding0;
+	float color[3];
+	float padding1;
+};
+
+struct SpotLightData {
+	float position[3];
+	float padding0;
+	float color[3];
+	float padding1;
+	float direction[3];
+	float inner_cutoff;
+	float outer_cutoff;
+	float padding2[3];
 };
 
 struct PushConstants {
 	float override_color[4];
 };
 
-static_assert(sizeof(GlobalUniforms) == 128);
-static_assert(sizeof(ObjectUniforms) == 96);
+static_assert(offsetof(SceneUniforms, camera_position) == 64);
+static_assert(offsetof(SceneUniforms, ambient_light) == 112);
+static_assert(offsetof(SceneUniforms, point_light_count) == 124);
+static_assert(offsetof(SceneUniforms, spot_light_count) == 128);
+static_assert(offsetof(ModelUniform, specular) == 80);
+static_assert(offsetof(ModelUniform, alpha) == 92);
+static_assert(offsetof(ModelUniform, use_vertex_colors) == 96);
+static_assert(sizeof(ModelUniform) == 112);
+static_assert(sizeof(PointLightData) == 32);
+static_assert(offsetof(SpotLightData, inner_cutoff) == 44);
+static_assert(sizeof(SpotLightData) == 64);
 
 enum class ProjectionType : int {
 	Perspective,
@@ -107,23 +146,24 @@ struct SceneObject {
 	bool orient_along_path;
 	bool show_path;
 
-	float color[3];
+	float albedo[3];
 	bool use_vertex_colors;
+	float specular[3];
+	float shininess;
 
 	float t;
 	math::Vector3 spin;
 
-	ObjectUniforms uniforms;
+	ModelUniform uniforms;
 
 	graphics::Buffer uniform_buffer;
 	VkDescriptorSet descriptor_set;
 };
 
 struct Camera {
-	math::Vector3 target = { 0.0f, 0.0f, 0.0f };
-	float yaw = 30.0f;
-	float pitch = 25.0f;
-	float distance = 15.0f;
+	math::Vector3 position = { 6.8f, 6.3f, 11.8f };
+	float yaw = -150.0f;
+	float pitch = -25.0f;
 
 	ProjectionType projection = ProjectionType::Perspective;
 	float fov = 60.0f;
@@ -131,6 +171,43 @@ struct Camera {
 	bool ortho_follow_distance = true;
 	float z_near = 0.1f;
 	float z_far = 100.0f;
+};
+
+struct PointLight {
+	math::Vector3 position;
+	float color[3];
+	float intensity;
+};
+
+struct SpotLight {
+	math::Vector3 position;
+	math::Vector3 direction;
+	float color[3];
+	float intensity;
+	float inner_angle;
+	float outer_angle;
+};
+
+struct Lighting {
+	float ambient_color[3] = { 1.0f, 1.0f, 1.0f };
+	float ambient_intensity = 0.1f;
+
+	math::Vector3 directional_direction = { -0.4f, -1.0f, -0.3f };
+	float directional_color[3] = { 1.0f, 0.96f, 0.9f };
+	float directional_intensity = 0.4f;
+
+	std::vector<PointLight> point_lights;
+	std::vector<SpotLight> spot_lights;
+};
+
+struct Ground {
+	float albedo[3] = { 0.55f, 0.55f, 0.6f };
+	float specular[3] = { 0.2f, 0.2f, 0.2f };
+	float shininess = 16.0f;
+
+	ModelUniform uniforms;
+	graphics::Buffer uniform_buffer;
+	VkDescriptorSet descriptor_set;
 };
 
 struct Settings {
@@ -154,11 +231,14 @@ struct PendingRelease {
 };
 
 constexpr uint32_t max_objects = 16;
+constexpr uint32_t max_point_lights = 16;
+constexpr uint32_t max_spot_lights = 16;
 constexpr uint32_t path_segments = 256;
 constexpr int grid_half_size = 10;
 constexpr uint32_t max_line_vertices = 2048 + max_objects * path_segments * 2;
+constexpr float ground_thickness = 0.1f;
 
-constexpr uint32_t max_descriptor_sets = 2 + max_objects;
+constexpr uint32_t max_model_sets = 2 + max_objects;
 
 const float object_palette[][3] = {
 	{ 1.00f, 1.00f, 1.00f },
@@ -170,15 +250,17 @@ const float object_palette[][3] = {
 	{ 0.70f, 0.55f, 1.00f },
 };
 
-VkDescriptorSetLayout vk_global_set_layout;
-VkDescriptorSetLayout vk_object_set_layout;
+VkDescriptorSetLayout vk_scene_set_layout;
+VkDescriptorSetLayout vk_model_set_layout;
 VkPipelineLayout vk_pipeline_layout;
-VkPipeline vk_pipeline_triangles;
+VkPipeline vk_pipeline_lit;
 VkPipeline vk_pipeline_lines;
 VkDescriptorPool vk_descriptor_pool;
 
-graphics::Buffer global_uniform_buffer;
-VkDescriptorSet vk_global_descriptor_set;
+graphics::Buffer scene_uniform_buffer;
+graphics::Buffer point_light_buffer;
+graphics::Buffer spot_light_buffer;
+VkDescriptorSet vk_scene_descriptor_set;
 
 graphics::Buffer world_uniform_buffer;
 VkDescriptorSet vk_world_descriptor_set;
@@ -196,14 +278,19 @@ int selected_object = 0;
 int created_objects = 0;
 
 Camera camera;
+Lighting lighting;
+Ground ground;
 Settings settings;
 
-GlobalUniforms global_uniforms;
+SceneUniforms scene_uniforms;
+math::Matrix4 view_matrix;
+math::Matrix4 projection_matrix;
+std::vector<PointLightData> point_light_data;
+std::vector<SpotLightData> spot_light_data;
 std::vector<Vertex> line_vertices;
 double last_time = -1.0;
 
-VkDescriptorSet allocateUniformSet(VkDescriptorSetLayout layout, const graphics::Buffer& buffer,
-                                   VkDeviceSize range) {
+VkDescriptorSet allocateDescriptorSet(VkDescriptorSetLayout layout) {
 	const VkDescriptorSetAllocateInfo descriptor_set = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
 		.descriptorPool = vk_descriptor_pool,
@@ -218,27 +305,35 @@ VkDescriptorSet allocateUniformSet(VkDescriptorSetLayout layout, const graphics:
 		return VK_NULL_HANDLE;
 	}
 
-	const VkDescriptorBufferInfo uniform_buffer_descriptor = {
+	return result;
+}
+
+void writeDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType type,
+                     const graphics::Buffer& buffer, VkDeviceSize range) {
+	const VkDescriptorBufferInfo buffer_descriptor = {
 		.buffer = buffer.buffer,
 		.offset = 0,
 		.range = range,
 	};
 
-	const VkWriteDescriptorSet descriptor_writes[] = {
-		{
-			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.dstSet = result,
-			.dstBinding = 0,
-			.descriptorCount = 1,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.pBufferInfo = &uniform_buffer_descriptor,
-		},
+	const VkWriteDescriptorSet descriptor_write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = set,
+		.dstBinding = binding,
+		.descriptorCount = 1,
+		.descriptorType = type,
+		.pBufferInfo = &buffer_descriptor,
 	};
 
-	vkUpdateDescriptorSets(context.device, sizeof(descriptor_writes) / sizeof(descriptor_writes[0]),
-	                       descriptor_writes, 0, nullptr);
+	vkUpdateDescriptorSets(context.device, 1, &descriptor_write, 0, nullptr);
+}
 
-	return result;
+VkDescriptorSet allocateModelSet(const graphics::Buffer& buffer) {
+	VkDescriptorSet set = allocateDescriptorSet(vk_model_set_layout);
+	if (set != VK_NULL_HANDLE) {
+		writeDescriptor(set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, buffer, sizeof(ModelUniform));
+	}
+	return set;
 }
 
 SceneObject makeObject() {
@@ -262,8 +357,10 @@ SceneObject makeObject() {
 		.spin_speed = { 0.0f, 60.0f, 0.0f },
 		.orient_along_path = false,
 		.show_path = true,
-		.color = { color[0], color[1], color[2] },
+		.albedo = { color[0], color[1], color[2] },
 		.use_vertex_colors = true,
+		.specular = { 0.5f, 0.5f, 0.5f },
+		.shininess = 32.0f,
 		.t = 0.0f,
 		.spin = { 0.0f, 0.0f, 0.0f },
 	};
@@ -277,13 +374,12 @@ bool addObject(SceneObject object) {
 		return false;
 	}
 
-	if (!graphics::createBuffer(sizeof(ObjectUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	if (!graphics::createBuffer(sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 	                            object.uniform_buffer)) {
 		return false;
 	}
 
-	object.descriptor_set = allocateUniformSet(vk_object_set_layout, object.uniform_buffer,
-	                                           sizeof(ObjectUniforms));
+	object.descriptor_set = allocateModelSet(object.uniform_buffer);
 	if (object.descriptor_set == VK_NULL_HANDLE) {
 		graphics::destroyBuffer(object.uniform_buffer);
 		return false;
@@ -313,6 +409,25 @@ void releasePending() {
 	pending_releases.clear();
 }
 
+PointLight makePointLight() {
+	return {
+		.position = { 0.0f, 2.0f, 0.0f },
+		.color = { 1.0f, 1.0f, 1.0f },
+		.intensity = 5.0f,
+	};
+}
+
+SpotLight makeSpotLight() {
+	return {
+		.position = { 0.0f, 5.0f, 0.0f },
+		.direction = { 0.0f, -1.0f, 0.0f },
+		.color = { 1.0f, 1.0f, 1.0f },
+		.intensity = 25.0f,
+		.inner_angle = 15.0f,
+		.outer_angle = 25.0f,
+	};
+}
+
 void createDefaultScene() {
 	SceneObject center = makeObject();
 	center.scale = { 1.6f, 1.6f, 1.6f };
@@ -328,7 +443,7 @@ void createDefaultScene() {
 	knot.scale = { 0.6f, 0.6f, 0.6f };
 	knot.spin_speed = { 0.0f, 0.0f, 0.0f };
 	knot.orient_along_path = true;
-	knot.color[0] = 1.0f; knot.color[1] = 1.0f; knot.color[2] = 1.0f;
+	knot.albedo[0] = 1.0f; knot.albedo[1] = 1.0f; knot.albedo[2] = 1.0f;
 	addObject(knot);
 
 	SceneObject lissajous = makeObject();
@@ -342,11 +457,26 @@ void createDefaultScene() {
 	lissajous.scale = { 0.5f, 0.5f, 0.9f };
 	lissajous.uniform_scale = false;
 	lissajous.spin_speed = { 0.0f, 90.0f, 45.0f };
-	lissajous.color[0] = 1.0f; lissajous.color[1] = 0.55f; lissajous.color[2] = 0.25f;
+	lissajous.albedo[0] = 1.0f; lissajous.albedo[1] = 0.55f; lissajous.albedo[2] = 0.25f;
 	lissajous.use_vertex_colors = false;
 	addObject(lissajous);
 
 	selected_object = 0;
+
+	lighting.point_lights.push_back({
+		.position = { -3.0f, 1.5f, 3.0f },
+		.color = { 1.0f, 0.6f, 0.3f },
+		.intensity = 6.0f,
+	});
+
+	lighting.spot_lights.push_back({
+		.position = { 2.0f, 6.0f, 1.0f },
+		.direction = { -0.2f, -1.0f, -0.1f },
+		.color = { 0.45f, 0.7f, 1.0f },
+		.intensity = 30.0f,
+		.inner_angle = 18.0f,
+		.outer_angle = 28.0f,
+	});
 }
 
 void setupFont() {
@@ -462,15 +592,15 @@ math::Matrix4 modelMatrix(const SceneObject& object) {
 	       math::Matrix4::scale(object.scale);
 }
 
-math::Vector3 cameraPosition() {
+math::Vector3 cameraForward() {
 	const float yaw = math::radians(camera.yaw);
 	const float pitch = math::radians(camera.pitch);
 
-	return camera.target + math::Vector3{
+	return {
 		std::cos(pitch) * std::sin(yaw),
 		std::sin(pitch),
 		std::cos(pitch) * std::cos(yaw),
-	} * camera.distance;
+	};
 }
 
 math::Matrix4 projectionMatrix() {
@@ -489,12 +619,18 @@ math::Matrix4 projectionMatrix() {
 	                                   camera.z_near, camera.z_far);
 }
 
+math::Vector3 lightDirection(const math::Vector3& direction) {
+	if (math::length(direction) < 1e-4f) {
+		return { 0.0f, -1.0f, 0.0f };
+	}
+	return math::normalize(direction);
+}
+
 void resetCamera() {
 	const Camera defaults;
-	camera.target = defaults.target;
+	camera.position = defaults.position;
 	camera.yaw = defaults.yaw;
 	camera.pitch = defaults.pitch;
-	camera.distance = defaults.distance;
 }
 
 void toggleProjection() {
@@ -504,8 +640,8 @@ void toggleProjection() {
 }
 
 void addLine(const math::Vector3& a, const math::Vector3& b, const math::Vector3& color) {
-	line_vertices.push_back({ a, color });
-	line_vertices.push_back({ b, color });
+	line_vertices.push_back({ a, { 0.0f, 0.0f, 0.0f }, color });
+	line_vertices.push_back({ b, { 0.0f, 0.0f, 0.0f }, color });
 }
 
 void buildLines() {
@@ -536,9 +672,9 @@ void buildLines() {
 		}
 
 		const math::Vector3 color = {
-			0.25f + 0.45f * object.color[0],
-			0.25f + 0.45f * object.color[1],
-			0.25f + 0.45f * object.color[2],
+			0.25f + 0.45f * object.albedo[0],
+			0.25f + 0.45f * object.albedo[1],
+			0.25f + 0.45f * object.albedo[2],
 		};
 
 		math::Vector3 previous = object.position + trajectoryPoint(object, 0.0f);
@@ -562,14 +698,14 @@ void handleInput() {
 	if (!io.WantCaptureMouse) {
 		if (ImGui::IsMouseDown(ImGuiMouseButton_Left) || ImGui::IsMouseDown(ImGuiMouseButton_Right)) {
 			camera.yaw -= io.MouseDelta.x * 0.3f;
-			camera.pitch = std::clamp(camera.pitch + io.MouseDelta.y * 0.3f, -89.0f, 89.0f);
+			camera.pitch = std::clamp(camera.pitch - io.MouseDelta.y * 0.3f, -89.0f, 89.0f);
 
 			if (camera.yaw > 180.0f) camera.yaw -= 360.0f;
 			if (camera.yaw < -180.0f) camera.yaw += 360.0f;
 		}
 
 		if (io.MouseWheel != 0.0f) {
-			camera.distance = std::clamp(camera.distance * std::pow(0.9f, io.MouseWheel), 1.5f, 80.0f);
+			camera.position += cameraForward() * io.MouseWheel;
 		}
 	}
 
@@ -624,26 +760,102 @@ void cameraUI() {
 	camera.z_far = std::max(camera.z_far, camera.z_near + 0.1f);
 
 	ImGui::SeparatorText("Камера");
-	ImGui::SliderFloat("Азимут, °", &camera.yaw, -180.0f, 180.0f, "%.0f");
-	ImGui::SliderFloat("Высота, °", &camera.pitch, -89.0f, 89.0f, "%.0f");
-	ImGui::SliderFloat("Расстояние", &camera.distance, 1.5f, 80.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
-	ImGui::DragFloat3("Точка взгляда", &camera.target.x, 0.05f);
+	ImGui::DragFloat3("Позиция", &camera.position.x, 0.05f, -50.0f, 50.0f, "%.2f");
+	ImGui::SliderFloat("Поворот влево-вправо, °", &camera.yaw, -180.0f, 180.0f, "%.0f");
+	ImGui::SliderFloat("Поворот вверх-вниз, °", &camera.pitch, -89.0f, 89.0f, "%.0f");
 	if (ImGui::Button("Сбросить камеру (R)")) {
 		resetCamera();
 	}
 
-	ImGui::TextDisabled("Мышь: ЛКМ/ПКМ — вращать, колесо — приблизить");
+	ImGui::TextDisabled("Мышь: ЛКМ/ПКМ — поворот, колесо — вперёд и назад");
 	ImGui::TextDisabled("Клавиши: P — проекция, Пробел — пауза, R — камера");
 
 	if (ImGui::TreeNode("Матрица проекции P")) {
-		matrixTable("##projection", global_uniforms.projection);
+		matrixTable("##projection", projection_matrix);
 		ImGui::TreePop();
 	}
 
 	if (ImGui::TreeNode("Видовая матрица V")) {
-		matrixTable("##view", global_uniforms.view);
+		matrixTable("##view", view_matrix);
 		ImGui::TreePop();
 	}
+}
+
+void lightingUI() {
+	if (!ImGui::CollapsingHeader("Освещение", ImGuiTreeNodeFlags_DefaultOpen)) {
+		return;
+	}
+
+	ImGui::SeparatorText("Рассеянный свет");
+	ImGui::ColorEdit3("Цвет##ambient", lighting.ambient_color);
+	ImGui::SliderFloat("Интенсивность##ambient", &lighting.ambient_intensity, 0.0f, 1.0f, "%.2f");
+
+	ImGui::SeparatorText("Направленный свет");
+	ImGui::DragFloat3("Направление##directional", &lighting.directional_direction.x, 0.01f, -1.0f, 1.0f, "%.2f");
+	ImGui::ColorEdit3("Цвет##directional", lighting.directional_color);
+	ImGui::SliderFloat("Интенсивность##directional", &lighting.directional_intensity, 0.0f, 3.0f, "%.2f");
+
+	ImGui::SeparatorText("Точечные источники");
+
+	int point_to_remove = -1;
+	for (int i = 0; i < int(lighting.point_lights.size()); ++i) {
+		PointLight& light = lighting.point_lights[size_t(i)];
+
+		ImGui::PushID(i);
+		if (ImGui::TreeNodeEx("##point", ImGuiTreeNodeFlags_DefaultOpen, "Точечный %d", i + 1)) {
+			ImGui::DragFloat3("Позиция", &light.position.x, 0.05f, -20.0f, 20.0f, "%.2f");
+			ImGui::ColorEdit3("Цвет", light.color);
+			ImGui::SliderFloat("Интенсивность", &light.intensity, 0.0f, 100.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+			if (ImGui::Button("Удалить")) {
+				point_to_remove = i;
+			}
+			ImGui::TreePop();
+		}
+		ImGui::PopID();
+	}
+
+	if (point_to_remove >= 0) {
+		lighting.point_lights.erase(lighting.point_lights.begin() + point_to_remove);
+	}
+
+	ImGui::BeginDisabled(lighting.point_lights.size() >= max_point_lights);
+	if (ImGui::Button("Добавить точечный")) {
+		lighting.point_lights.push_back(makePointLight());
+	}
+	ImGui::EndDisabled();
+
+	ImGui::SeparatorText("Прожекторы");
+
+	int spot_to_remove = -1;
+	for (int i = 0; i < int(lighting.spot_lights.size()); ++i) {
+		SpotLight& light = lighting.spot_lights[size_t(i)];
+
+		ImGui::PushID(i);
+		if (ImGui::TreeNodeEx("##spot", ImGuiTreeNodeFlags_DefaultOpen, "Прожектор %d", i + 1)) {
+			ImGui::DragFloat3("Позиция", &light.position.x, 0.05f, -20.0f, 20.0f, "%.2f");
+			ImGui::DragFloat3("Направление", &light.direction.x, 0.01f, -1.0f, 1.0f, "%.2f");
+			ImGui::ColorEdit3("Цвет", light.color);
+			ImGui::SliderFloat("Интенсивность", &light.intensity, 0.0f, 200.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+			ImGui::SliderFloat("Внутренний угол, °", &light.inner_angle, 1.0f, 89.0f, "%.0f");
+			ImGui::SliderFloat("Внешний угол, °", &light.outer_angle, 1.0f, 89.0f, "%.0f");
+			light.outer_angle = std::max(light.outer_angle, light.inner_angle);
+			if (ImGui::Button("Удалить")) {
+				spot_to_remove = i;
+			}
+			ImGui::TreePop();
+		}
+		ImGui::PopID();
+	}
+
+	if (spot_to_remove >= 0) {
+		lighting.spot_lights.erase(lighting.spot_lights.begin() + spot_to_remove);
+	}
+
+	ImGui::BeginDisabled(lighting.spot_lights.size() >= max_spot_lights);
+	if (ImGui::Button("Добавить прожектор")) {
+		lighting.spot_lights.push_back(makeSpotLight());
+	}
+	ImGui::EndDisabled();
 }
 
 void animationUI() {
@@ -747,9 +959,11 @@ void objectEditorUI(SceneObject& object) {
 	ImGui::Checkbox("Показывать путь", &object.show_path);
 	ImGui::EndDisabled();
 
-	ImGui::SeparatorText("Цвет");
-	ImGui::ColorEdit3("Цвет фигуры", object.color);
+	ImGui::SeparatorText("Материал");
+	ImGui::ColorEdit3("Альбедо (цвет фигуры)", object.albedo);
 	ImGui::Checkbox("Умножать на цвета вершин", &object.use_vertex_colors);
+	ImGui::ColorEdit3("Цвет блика", object.specular);
+	ImGui::SliderFloat("Коэффициент блика", &object.shininess, 1.0f, 256.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
 
 	if (ImGui::TreeNode("Матрица модели M")) {
 		matrixTable("##model", object.uniforms.model);
@@ -802,7 +1016,7 @@ void objectsUI() {
 	ImGui::EndDisabled();
 
 	ImGui::TextDisabled("Объектов: %d / %u, наборов дескрипторов: %d",
-	                    int(objects.size()), max_objects, int(objects.size()) + 2);
+	                    int(objects.size()), max_objects, int(objects.size()) + 3);
 
 	if (!objects.empty()) {
 		objectEditorUI(objects[size_t(selected_object)]);
@@ -828,8 +1042,14 @@ void displayUI() {
 	ImGui::Checkbox("Сетка", &settings.show_grid);
 	ImGui::SameLine();
 	ImGui::Checkbox("Оси координат", &settings.show_axes);
-	ImGui::SliderFloat("Высота сетки", &settings.grid_height, -10.0f, 10.0f, "%.1f");
+	ImGui::SliderFloat("Высота сетки и пола", &settings.grid_height, -10.0f, 10.0f, "%.1f");
 	ImGui::ColorEdit3("Фон", settings.background, ImGuiColorEditFlags_NoInputs);
+
+	ImGui::SeparatorText("Материал пола");
+	ImGui::ColorEdit3("Альбедо##ground", ground.albedo);
+	ImGui::ColorEdit3("Цвет блика##ground", ground.specular);
+	ImGui::SliderFloat("Коэффициент блика##ground", &ground.shininess, 1.0f, 256.0f, "%.0f",
+	                   ImGuiSliderFlags_Logarithmic);
 }
 
 void figureUI() {
@@ -837,7 +1057,7 @@ void figureUI() {
 		return;
 	}
 
-	const int v = int(mesh.vertices.size());
+	const int v = int(mesh.corner_count);
 	const int e = int(mesh.edges.size() / 2);
 	const int f = int(mesh.face_count);
 
@@ -845,6 +1065,7 @@ void figureUI() {
 	                   "грани — квадраты, в каждой вершине сходятся 3 грани.");
 	ImGui::Text("Вершин V = %d, рёбер E = %d, граней F = %d", v, e, f);
 	ImGui::Text("Эйлерова характеристика V − E + F = %d", v - e + f);
+	ImGui::Text("Вершин в буфере: %d (по 4 на грань, у каждой своя нормаль)", int(mesh.vertices.size()));
 	ImGui::Text("Треугольников: %d, индексов: %d", int(mesh.triangles.size() / 3),
 	            int(mesh.triangles.size()));
 
@@ -883,13 +1104,14 @@ void drawUI() {
 	                        ImGuiCond_FirstUseEver);
 	ImGui::SetNextWindowSize(ImVec2(420.0f, viewport->WorkSize.y - 20.0f), ImGuiCond_FirstUseEver);
 
-	if (ImGui::Begin("Лабораторная работа №1")) {
+	if (ImGui::Begin("Лабораторная работа №2")) {
 		ImGui::PushItemWidth(-ImGui::GetFontSize() * 9.5f);
 
 		ImGui::Text("Вариант 12: правильный гексаэдр");
 		ImGui::Separator();
 
 		cameraUI();
+		lightingUI();
 		animationUI();
 		objectsUI();
 		displayUI();
@@ -903,32 +1125,59 @@ void drawUI() {
 }
 
 bool createResources() {
-	const VkDescriptorSetLayoutBinding descriptor_set_bindings[] = {
+	const VkDescriptorSetLayoutBinding scene_bindings[] = {
 		{
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1,
-			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 2,
+			.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
 
-	const VkDescriptorSetLayoutCreateInfo descriptor_set_layout = {
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		.bindingCount = sizeof(descriptor_set_bindings) / sizeof(descriptor_set_bindings[0]),
-		.pBindings = descriptor_set_bindings,
+	const VkDescriptorSetLayoutBinding model_bindings[] = {
+		{
+			.binding = 0,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
 	};
 
-	if (vkCreateDescriptorSetLayout(context.device, &descriptor_set_layout, nullptr,
-	                                &vk_global_set_layout) != VK_SUCCESS ||
-	    vkCreateDescriptorSetLayout(context.device, &descriptor_set_layout, nullptr,
-	                                &vk_object_set_layout) != VK_SUCCESS) {
+	const VkDescriptorSetLayoutCreateInfo scene_set_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = sizeof(scene_bindings) / sizeof(scene_bindings[0]),
+		.pBindings = scene_bindings,
+	};
+
+	const VkDescriptorSetLayoutCreateInfo model_set_layout = {
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.bindingCount = sizeof(model_bindings) / sizeof(model_bindings[0]),
+		.pBindings = model_bindings,
+	};
+
+	if (vkCreateDescriptorSetLayout(context.device, &scene_set_layout, nullptr,
+	                                &vk_scene_set_layout) != VK_SUCCESS ||
+	    vkCreateDescriptorSetLayout(context.device, &model_set_layout, nullptr,
+	                                &vk_model_set_layout) != VK_SUCCESS) {
 		std::cerr << "Failed to create descriptor set layout\n";
 		return false;
 	}
 
 	const VkDescriptorSetLayout set_layouts[] = {
-		vk_global_set_layout,
-		vk_object_set_layout,
+		vk_scene_set_layout,
+		vk_model_set_layout,
 	};
 
 	const VkPushConstantRange push_constant_range = {
@@ -951,10 +1200,13 @@ bool createResources() {
 		return false;
 	}
 
-	VkShaderModule vertex_shader = graphics::loadShaderModule("scene.vert.spv");
-	VkShaderModule fragment_shader = graphics::loadShaderModule("scene.frag.spv");
+	VkShaderModule scene_vertex_shader = graphics::loadShaderModule("scene.vert.spv");
+	VkShaderModule scene_fragment_shader = graphics::loadShaderModule("scene.frag.spv");
+	VkShaderModule lines_vertex_shader = graphics::loadShaderModule("lines.vert.spv");
+	VkShaderModule lines_fragment_shader = graphics::loadShaderModule("lines.frag.spv");
 
-	if (vertex_shader != VK_NULL_HANDLE && fragment_shader != VK_NULL_HANDLE) {
+	if (scene_vertex_shader != VK_NULL_HANDLE && scene_fragment_shader != VK_NULL_HANDLE &&
+	    lines_vertex_shader != VK_NULL_HANDLE && lines_fragment_shader != VK_NULL_HANDLE) {
 		const VkVertexInputBindingDescription vertex_bindings[] = {
 			{
 				.binding = 0,
@@ -963,7 +1215,28 @@ bool createResources() {
 			},
 		};
 
-		const VkVertexInputAttributeDescription vertex_attributes[] = {
+		const VkVertexInputAttributeDescription lit_attributes[] = {
+			{
+				.location = 0,
+				.binding = 0,
+				.format = VK_FORMAT_R32G32B32_SFLOAT,
+				.offset = offsetof(Vertex, position),
+			},
+			{
+				.location = 1,
+				.binding = 0,
+				.format = VK_FORMAT_R32G32B32_SFLOAT,
+				.offset = offsetof(Vertex, normal),
+			},
+			{
+				.location = 2,
+				.binding = 0,
+				.format = VK_FORMAT_R32G32B32_SFLOAT,
+				.offset = offsetof(Vertex, color),
+			},
+		};
+
+		const VkVertexInputAttributeDescription line_attributes[] = {
 			{
 				.location = 0,
 				.binding = 0,
@@ -978,45 +1251,60 @@ bool createResources() {
 			},
 		};
 
-		graphics::PipelineDescription pipeline = {
-			.vertex_shader = vertex_shader,
-			.fragment_shader = fragment_shader,
+		const graphics::PipelineDescription lit_pipeline = {
+			.vertex_shader = scene_vertex_shader,
+			.fragment_shader = scene_fragment_shader,
 			.layout = vk_pipeline_layout,
 			.vertex_bindings = vertex_bindings,
 			.vertex_binding_count = sizeof(vertex_bindings) / sizeof(vertex_bindings[0]),
-			.vertex_attributes = vertex_attributes,
-			.vertex_attribute_count = sizeof(vertex_attributes) / sizeof(vertex_attributes[0]),
+			.vertex_attributes = lit_attributes,
+			.vertex_attribute_count = sizeof(lit_attributes) / sizeof(lit_attributes[0]),
 			.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
 			.cull_mode = VK_CULL_MODE_BACK_BIT,
 			.depth_bias = true,
 		};
 
-		vk_pipeline_triangles = graphics::createGraphicsPipeline(pipeline);
+		const graphics::PipelineDescription lines_pipeline = {
+			.vertex_shader = lines_vertex_shader,
+			.fragment_shader = lines_fragment_shader,
+			.layout = vk_pipeline_layout,
+			.vertex_bindings = vertex_bindings,
+			.vertex_binding_count = sizeof(vertex_bindings) / sizeof(vertex_bindings[0]),
+			.vertex_attributes = line_attributes,
+			.vertex_attribute_count = sizeof(line_attributes) / sizeof(line_attributes[0]),
+			.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+			.cull_mode = VK_CULL_MODE_NONE,
+			.depth_bias = false,
+		};
 
-		pipeline.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
-		pipeline.cull_mode = VK_CULL_MODE_NONE;
-		pipeline.depth_bias = false;
-		vk_pipeline_lines = graphics::createGraphicsPipeline(pipeline);
+		vk_pipeline_lit = graphics::createGraphicsPipeline(lit_pipeline);
+		vk_pipeline_lines = graphics::createGraphicsPipeline(lines_pipeline);
 	}
 
-	vkDestroyShaderModule(context.device, vertex_shader, nullptr);
-	vkDestroyShaderModule(context.device, fragment_shader, nullptr);
+	vkDestroyShaderModule(context.device, scene_vertex_shader, nullptr);
+	vkDestroyShaderModule(context.device, scene_fragment_shader, nullptr);
+	vkDestroyShaderModule(context.device, lines_vertex_shader, nullptr);
+	vkDestroyShaderModule(context.device, lines_fragment_shader, nullptr);
 
-	if (vk_pipeline_triangles == VK_NULL_HANDLE || vk_pipeline_lines == VK_NULL_HANDLE) {
+	if (vk_pipeline_lit == VK_NULL_HANDLE || vk_pipeline_lines == VK_NULL_HANDLE) {
 		return false;
 	}
 
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.descriptorCount = max_descriptor_sets,
+			.descriptorCount = 1 + max_model_sets,
+		},
+		{
+			.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+			.descriptorCount = 2,
 		},
 	};
 
 	const VkDescriptorPoolCreateInfo descriptor_pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
 		.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-		.maxSets = max_descriptor_sets,
+		.maxSets = 1 + max_model_sets,
 		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
 		.pPoolSizes = descriptor_pool_sizes,
 	};
@@ -1027,31 +1315,45 @@ bool createResources() {
 		return false;
 	}
 
-	if (!graphics::createBuffer(sizeof(GlobalUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                            global_uniform_buffer)) {
+	if (!graphics::createBuffer(sizeof(SceneUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	                            scene_uniform_buffer) ||
+	    !graphics::createBuffer(max_point_lights * sizeof(PointLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+	                            point_light_buffer) ||
+	    !graphics::createBuffer(max_spot_lights * sizeof(SpotLightData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+	                            spot_light_buffer)) {
 		return false;
 	}
 
-	vk_global_descriptor_set = allocateUniformSet(vk_global_set_layout, global_uniform_buffer,
-	                                              sizeof(GlobalUniforms));
-	if (vk_global_descriptor_set == VK_NULL_HANDLE) {
+	vk_scene_descriptor_set = allocateDescriptorSet(vk_scene_set_layout);
+	if (vk_scene_descriptor_set == VK_NULL_HANDLE) {
 		return false;
 	}
 
-	if (!graphics::createBuffer(sizeof(ObjectUniforms), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                            world_uniform_buffer)) {
+	writeDescriptor(vk_scene_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+	                scene_uniform_buffer, sizeof(SceneUniforms));
+	writeDescriptor(vk_scene_descriptor_set, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	                point_light_buffer, VK_WHOLE_SIZE);
+	writeDescriptor(vk_scene_descriptor_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+	                spot_light_buffer, VK_WHOLE_SIZE);
+
+	if (!graphics::createBuffer(sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	                            world_uniform_buffer) ||
+	    !graphics::createBuffer(sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	                            ground.uniform_buffer)) {
 		return false;
 	}
 
-	vk_world_descriptor_set = allocateUniformSet(vk_object_set_layout, world_uniform_buffer,
-	                                             sizeof(ObjectUniforms));
-	if (vk_world_descriptor_set == VK_NULL_HANDLE) {
+	vk_world_descriptor_set = allocateModelSet(world_uniform_buffer);
+	ground.descriptor_set = allocateModelSet(ground.uniform_buffer);
+	if (vk_world_descriptor_set == VK_NULL_HANDLE || ground.descriptor_set == VK_NULL_HANDLE) {
 		return false;
 	}
 
-	const ObjectUniforms world_uniforms = {
+	const ModelUniform world_uniforms = {
 		.model = math::Matrix4::identity(),
-		.color = { 1.0f, 1.0f, 1.0f, 1.0f },
+		.albedo = { 1.0f, 1.0f, 1.0f },
+		.specular = { 0.0f, 0.0f, 0.0f },
+		.alpha = 1.0f,
 		.use_vertex_colors = 1.0f,
 	};
 	graphics::writeBuffer(world_uniform_buffer, &world_uniforms, sizeof(world_uniforms));
@@ -1110,22 +1412,25 @@ void shutdown() {
 	graphics::destroyBuffer(edge_index_buffer);
 	graphics::destroyBuffer(triangle_index_buffer);
 	graphics::destroyBuffer(vertex_buffer);
+	graphics::destroyBuffer(ground.uniform_buffer);
 	graphics::destroyBuffer(world_uniform_buffer);
-	graphics::destroyBuffer(global_uniform_buffer);
+	graphics::destroyBuffer(spot_light_buffer);
+	graphics::destroyBuffer(point_light_buffer);
+	graphics::destroyBuffer(scene_uniform_buffer);
 
 	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
 	vkDestroyPipeline(context.device, vk_pipeline_lines, nullptr);
-	vkDestroyPipeline(context.device, vk_pipeline_triangles, nullptr);
+	vkDestroyPipeline(context.device, vk_pipeline_lit, nullptr);
 	vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
-	vkDestroyDescriptorSetLayout(context.device, vk_object_set_layout, nullptr);
-	vkDestroyDescriptorSetLayout(context.device, vk_global_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_model_set_layout, nullptr);
+	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
 
 	vk_descriptor_pool = VK_NULL_HANDLE;
 	vk_pipeline_lines = VK_NULL_HANDLE;
-	vk_pipeline_triangles = VK_NULL_HANDLE;
+	vk_pipeline_lit = VK_NULL_HANDLE;
 	vk_pipeline_layout = VK_NULL_HANDLE;
-	vk_object_set_layout = VK_NULL_HANDLE;
-	vk_global_set_layout = VK_NULL_HANDLE;
+	vk_model_set_layout = VK_NULL_HANDLE;
+	vk_scene_set_layout = VK_NULL_HANDLE;
 }
 
 void update(double time) {
@@ -1158,19 +1463,69 @@ void update(double time) {
 	}
 
 	if (camera.ortho_follow_distance) {
-		camera.ortho_height = 2.0f * camera.distance * std::tan(math::radians(camera.fov) * 0.5f);
+		camera.ortho_height = 2.0f * math::length(camera.position) * std::tan(math::radians(camera.fov) * 0.5f);
 	}
 
-	global_uniforms.view = math::Matrix4::lookAt(cameraPosition(), camera.target, { 0.0f, 1.0f, 0.0f });
-	global_uniforms.projection = projectionMatrix();
+	view_matrix = math::Matrix4::lookAt(camera.position, camera.position + cameraForward(), { 0.0f, 1.0f, 0.0f });
+	projection_matrix = projectionMatrix();
+
+	const math::Vector3 directional = lightDirection(lighting.directional_direction);
+	const float* dc = lighting.directional_color;
+	const float* ac = lighting.ambient_color;
+	const float di = lighting.directional_intensity;
+	const float ai = lighting.ambient_intensity;
+
+	scene_uniforms = {
+		.view_projection = projection_matrix * view_matrix,
+		.camera_position = { camera.position.x, camera.position.y, camera.position.z },
+		.directional_light_direction = { directional.x, directional.y, directional.z },
+		.directional_light_color = { dc[0] * di, dc[1] * di, dc[2] * di },
+		.ambient_light = { ac[0] * ai, ac[1] * ai, ac[2] * ai },
+		.point_light_count = uint32_t(lighting.point_lights.size()),
+		.spot_light_count = uint32_t(lighting.spot_lights.size()),
+	};
+
+	point_light_data.clear();
+	for (const PointLight& light : lighting.point_lights) {
+		const float i = light.intensity;
+		point_light_data.push_back({
+			.position = { light.position.x, light.position.y, light.position.z },
+			.color = { light.color[0] * i, light.color[1] * i, light.color[2] * i },
+		});
+	}
+
+	spot_light_data.clear();
+	for (const SpotLight& light : lighting.spot_lights) {
+		const float i = light.intensity;
+		const math::Vector3 direction = lightDirection(light.direction);
+		spot_light_data.push_back({
+			.position = { light.position.x, light.position.y, light.position.z },
+			.color = { light.color[0] * i, light.color[1] * i, light.color[2] * i },
+			.direction = { direction.x, direction.y, direction.z },
+			.inner_cutoff = std::cos(math::radians(light.inner_angle)),
+			.outer_cutoff = std::cos(math::radians(light.outer_angle)),
+		});
+	}
 
 	for (SceneObject& object : objects) {
 		object.uniforms = {
 			.model = modelMatrix(object),
-			.color = { object.color[0], object.color[1], object.color[2], 1.0f },
+			.albedo = { object.albedo[0], object.albedo[1], object.albedo[2] },
+			.specular = { object.specular[0], object.specular[1], object.specular[2] },
+			.alpha = object.shininess,
 			.use_vertex_colors = object.use_vertex_colors ? 1.0f : 0.0f,
 		};
 	}
+
+	const float ground_size = 2.0f * float(grid_half_size);
+	ground.uniforms = {
+		.model = math::Matrix4::translation({ 0.0f, settings.grid_height - ground_thickness * 0.5f, 0.0f }) *
+		         math::Matrix4::scale({ ground_size, ground_thickness, ground_size }),
+		.albedo = { ground.albedo[0], ground.albedo[1], ground.albedo[2] },
+		.specular = { ground.specular[0], ground.specular[1], ground.specular[2] },
+		.alpha = ground.shininess,
+		.use_vertex_colors = 0.0f,
+	};
 
 	buildLines();
 }
@@ -1188,11 +1543,23 @@ void render(const graphics::internal::FrameData& fd) {
 		settings.mesh_dirty = false;
 	}
 
-	graphics::writeBuffer(global_uniform_buffer, &global_uniforms, sizeof(global_uniforms));
+	graphics::writeBuffer(scene_uniform_buffer, &scene_uniforms, sizeof(scene_uniforms));
+
+	if (!point_light_data.empty()) {
+		graphics::writeBuffer(point_light_buffer, point_light_data.data(),
+		                      point_light_data.size() * sizeof(PointLightData));
+	}
+
+	if (!spot_light_data.empty()) {
+		graphics::writeBuffer(spot_light_buffer, spot_light_data.data(),
+		                      spot_light_data.size() * sizeof(SpotLightData));
+	}
 
 	for (const SceneObject& object : objects) {
 		graphics::writeBuffer(object.uniform_buffer, &object.uniforms, sizeof(object.uniforms));
 	}
+
+	graphics::writeBuffer(ground.uniform_buffer, &ground.uniforms, sizeof(ground.uniforms));
 
 	const uint32_t line_vertex_count = uint32_t(line_vertices.size());
 	if (line_vertex_count > 0) {
@@ -1240,15 +1607,11 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
 	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-	                        0, 1, &vk_global_descriptor_set, 0, nullptr);
-
-	const PushConstants no_override = {};
-	vkCmdPushConstants(cmd, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-	                   0, sizeof(no_override), &no_override);
+	                        0, 1, &vk_scene_descriptor_set, 0, nullptr);
 
 	const VkDeviceSize vertex_buffer_offset = 0;
 
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_triangles);
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_lit);
 	vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.buffer, &vertex_buffer_offset);
 	vkCmdBindIndexBuffer(cmd, triangle_index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
@@ -1258,7 +1621,15 @@ void render(const graphics::internal::FrameData& fd) {
 		vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
 	}
 
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        1, 1, &ground.descriptor_set, 0, nullptr);
+	vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
+
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_lines);
+
+	const PushConstants no_override = {};
+	vkCmdPushConstants(cmd, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+	                   0, sizeof(no_override), &no_override);
 
 	if (settings.show_edges) {
 		const PushConstants edge_override = {

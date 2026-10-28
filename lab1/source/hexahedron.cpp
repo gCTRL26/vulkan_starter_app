@@ -35,36 +35,45 @@ math::Vector3 mix(const math::Vector3& a, const math::Vector3& b, float t) {
 Mesh build(float edge_length) {
 	Mesh mesh = {
 		.edge_length = edge_length,
+		.corner_count = 8,
 		.face_count = 0,
 	};
 
 	const float h = edge_length * 0.5f;
 
+	math::Vector3 corners[8];
 	for (uint32_t i = 0; i < 8; ++i) {
-		mesh.vertices.push_back({
-			.position = { (i & 1) ? h : -h, (i & 2) ? h : -h, (i & 4) ? h : -h },
-			.color = { 1.0f, 1.0f, 1.0f },
-		});
+		corners[i] = { (i & 1) ? h : -h, (i & 2) ? h : -h, (i & 4) ? h : -h };
 	}
+
+	uint32_t corner_vertex[8] = {};
 
 	for (uint32_t axis = 0; axis < 3; ++axis) {
 		const uint32_t u = (axis + 1) % 3;
 		const uint32_t v = (axis + 2) % 3;
 
 		for (uint32_t side = 0; side < 2; ++side) {
-			const uint32_t corners[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+			const uint32_t square[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
 
-			uint32_t quad[4];
-			math::Vector3 center = { 0.0f, 0.0f, 0.0f };
+			float n[3] = { 0.0f, 0.0f, 0.0f };
+			n[axis] = side ? 1.0f : -1.0f;
+			const math::Vector3 normal = { n[0], n[1], n[2] };
+
+			const uint32_t first = uint32_t(mesh.vertices.size());
 
 			for (uint32_t c = 0; c < 4; ++c) {
-				quad[c] = (side << axis) | (corners[c][0] << u) | (corners[c][1] << v);
-				center += mesh.vertices[quad[c]].position;
+				const uint32_t corner = (side << axis) | (square[c][0] << u) | (square[c][1] << v);
+				corner_vertex[corner] = uint32_t(mesh.vertices.size());
+				mesh.vertices.push_back({
+					.position = corners[corner],
+					.normal = normal,
+					.color = { 1.0f, 1.0f, 1.0f },
+				});
 			}
 
 			uint32_t triangles[2][3] = {
-				{ quad[0], quad[1], quad[2] },
-				{ quad[0], quad[2], quad[3] },
+				{ first, first + 1, first + 2 },
+				{ first, first + 2, first + 3 },
 			};
 
 			for (auto& triangle : triangles) {
@@ -72,7 +81,7 @@ Mesh build(float edge_length) {
 				const math::Vector3& b = mesh.vertices[triangle[1]].position;
 				const math::Vector3& c = mesh.vertices[triangle[2]].position;
 
-				if (math::dot(math::cross(b - a, c - a), center) > 0.0f) {
+				if (math::dot(math::cross(b - a, c - a), normal) > 0.0f) {
 					std::swap(triangle[1], triangle[2]);
 				}
 
@@ -86,8 +95,8 @@ Mesh build(float edge_length) {
 	for (uint32_t i = 0; i < 8; ++i) {
 		for (uint32_t j = i + 1; j < 8; ++j) {
 			if (std::has_single_bit(i ^ j)) {
-				mesh.edges.push_back(i);
-				mesh.edges.push_back(j);
+				mesh.edges.push_back(corner_vertex[i]);
+				mesh.edges.push_back(corner_vertex[j]);
 			}
 		}
 	}
