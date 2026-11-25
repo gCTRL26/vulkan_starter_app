@@ -2,7 +2,9 @@
 
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
-layout(location = 2) in vec3 in_color;
+layout(location = 2) in vec2 in_uv;
+
+layout(set = 1, binding = 1) uniform sampler2D albedo_texture;
 
 layout(location = 0) out vec4 out_color;
 
@@ -39,10 +41,9 @@ layout(std430, set = 0, binding = 2) readonly buffer SpotLights {
 
 layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	mat4 model;
-	vec3 albedo;
+	vec4 line_color;
 	vec3 specular;
 	float alpha;
-	float use_vertex_colors;
 } model_uniforms;
 
 vec3 blinnPhong(vec3 n, vec3 v, vec3 l, vec3 light, vec3 albedo) {
@@ -56,7 +57,7 @@ vec3 blinnPhong(vec3 n, vec3 v, vec3 l, vec3 light, vec3 albedo) {
 void main() {
 	vec3 n = normalize(in_normal);
 	vec3 v = normalize(scene_uniforms.camera_position - in_position);
-	vec3 albedo = model_uniforms.albedo * in_color;
+	vec3 albedo = texture(albedo_texture, in_uv).rgb;
 
 	vec3 color = scene_uniforms.ambient_light * albedo;
 

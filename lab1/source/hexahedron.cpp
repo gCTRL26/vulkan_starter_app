@@ -6,32 +6,6 @@
 
 namespace hexahedron {
 
-namespace {
-
-math::Vector3 hsvToRgb(float h, float s, float v) {
-	h = (h - std::floor(h)) * 6.0f;
-	const int sector = int(h) % 6;
-	const float f = h - std::floor(h);
-	const float p = v * (1.0f - s);
-	const float q = v * (1.0f - s * f);
-	const float t = v * (1.0f - s * (1.0f - f));
-
-	switch (sector) {
-	case 0: return { v, t, p };
-	case 1: return { q, v, p };
-	case 2: return { p, v, t };
-	case 3: return { p, q, v };
-	case 4: return { t, p, v };
-	default: return { v, p, q };
-	}
-}
-
-math::Vector3 mix(const math::Vector3& a, const math::Vector3& b, float t) {
-	return a * (1.0f - t) + b * t;
-}
-
-} // namespace
-
 Mesh build(float edge_length) {
 	Mesh mesh = {
 		.edge_length = edge_length,
@@ -68,6 +42,7 @@ Mesh build(float edge_length) {
 					.position = corners[corner],
 					.normal = normal,
 					.color = { 1.0f, 1.0f, 1.0f },
+					.uv = { float(square[c][0]), float(square[c][1]) },
 				});
 			}
 
@@ -102,39 +77,6 @@ Mesh build(float edge_length) {
 	}
 
 	return mesh;
-}
-
-void paint(Mesh& mesh, ColorScheme scheme) {
-	const float h = mesh.edge_length * 0.5f;
-
-	for (Vertex& vertex : mesh.vertices) {
-		const math::Vector3& p = vertex.position;
-
-		const math::Vector3 n = {
-			(p.x / h + 1.0f) * 0.5f,
-			(p.y / h + 1.0f) * 0.5f,
-			(p.z / h + 1.0f) * 0.5f,
-		};
-
-		switch (scheme) {
-		case ColorScheme::PositionRGB:
-			vertex.color = n;
-			break;
-
-		case ColorScheme::HeightGradient:
-			vertex.color = mix({ 0.10f, 0.25f, 0.95f }, { 1.00f, 0.60f, 0.10f }, n.y);
-			break;
-
-		case ColorScheme::HueAroundY: {
-			const float hue = std::atan2(p.z, p.x) / (2.0f * math::pi) + 0.5f;
-			vertex.color = hsvToRgb(hue, 0.85f, 0.35f + 0.65f * n.y);
-			break;
-		}
-
-		default:
-			break;
-		}
-	}
 }
 
 } // namespace hexahedron

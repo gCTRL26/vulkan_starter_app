@@ -9,22 +9,10 @@ struct Vertex {
 	math::Vector3 position;
 	math::Vector3 normal;
 	math::Vector3 color;
+	float uv[2];
 };
 
 namespace hexahedron {
-
-enum class ColorScheme : int {
-	PositionRGB,
-	HeightGradient,
-	HueAroundY,
-	Count,
-};
-
-inline const char* const color_scheme_names[] = {
-	"RGB по координатам (x, y, z)",
-	"Градиент по высоте (y)",
-	"Радуга по углу вокруг оси Y",
-};
 
 struct Mesh {
 	float edge_length;
@@ -36,7 +24,5 @@ struct Mesh {
 };
 
 Mesh build(float edge_length);
-
-void paint(Mesh& mesh, ColorScheme scheme);
 
 } // namespace hexahedron

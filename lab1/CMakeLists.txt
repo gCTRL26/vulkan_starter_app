@@ -1,11 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
-project(cg-lab2 LANGUAGES C CXX)
+project(cg-lab3 LANGUAGES C CXX)
 
 add_executable(${PROJECT_NAME}
 	source/main.cpp
 	source/graphics_internal.cpp
+	source/texture.cpp
 	source/graphics.cpp
 	source/hexahedron.cpp
 	source/application.cpp
@@ -55,6 +56,14 @@ FetchContent_Declare(
 	GIT_REPOSITORY https://github.com/ocornut/imgui.git
 	GIT_TAG v1.92.9
 )
+
+FetchContent_Declare(lodepng
+    GIT_REPOSITORY https://github.com/lvandeve/lodepng.git
+    GIT_TAG 7b2893e35891c0c85bee5595caafaf3c2044b409
+)
+FetchContent_MakeAvailable(lodepng)
+target_sources(${PROJECT_NAME} PRIVATE ${lodepng_SOURCE_DIR}/lodepng.cpp)
+target_include_directories(${PROJECT_NAME} PRIVATE ${lodepng_SOURCE_DIR})
 
 find_package(Vulkan REQUIRED)
 

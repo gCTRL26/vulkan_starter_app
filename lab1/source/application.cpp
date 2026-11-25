@@ -11,6 +11,7 @@
 #include <imgui.h>
 
 #include "graphics.hpp"
+#include "texture.hpp"
 #include "hexahedron.hpp"
 #include "math.hpp"
 
@@ -36,12 +37,9 @@ struct SceneUniforms {
 
 struct ModelUniform {
 	math::Matrix4 model;
-	float albedo[3];
-	float padding0;
+	float line_color[4];
 	float specular[3];
 	float alpha;
-	float use_vertex_colors;
-	float padding1[3];
 };
 
 struct PointLightData {
@@ -62,18 +60,13 @@ struct SpotLightData {
 	float padding2[3];
 };
 
-struct PushConstants {
-	float override_color[4];
-};
-
 static_assert(offsetof(SceneUniforms, camera_position) == 64);
 static_assert(offsetof(SceneUniforms, ambient_light) == 112);
 static_assert(offsetof(SceneUniforms, point_light_count) == 124);
 static_assert(offsetof(SceneUniforms, spot_light_count) == 128);
 static_assert(offsetof(ModelUniform, specular) == 80);
 static_assert(offsetof(ModelUniform, alpha) == 92);
-static_assert(offsetof(ModelUniform, use_vertex_colors) == 96);
-static_assert(sizeof(ModelUniform) == 112);
+static_assert(sizeof(ModelUniform) == 96);
 static_assert(sizeof(PointLightData) == 32);
 static_assert(offsetof(SpotLightData, inner_cutoff) == 44);
 static_assert(sizeof(SpotLightData) == 64);
@@ -146,8 +139,7 @@ struct SceneObject {
 	bool orient_along_path;
 	bool show_path;
 
-	float albedo[3];
-	bool use_vertex_colors;
+	float path_color[3];
 	float specular[3];
 	float shininess;
 
@@ -156,8 +148,6 @@ struct SceneObject {
 
 	ModelUniform uniforms;
 
-	graphics::Buffer uniform_buffer;
-	VkDescriptorSet descriptor_set;
 };
 
 struct Camera {
@@ -201,21 +191,15 @@ struct Lighting {
 };
 
 struct Ground {
-	float albedo[3] = { 0.55f, 0.55f, 0.6f };
 	float specular[3] = { 0.2f, 0.2f, 0.2f };
 	float shininess = 16.0f;
 
 	ModelUniform uniforms;
-	graphics::Buffer uniform_buffer;
-	VkDescriptorSet descriptor_set;
 };
 
 struct Settings {
 	bool playing = true;
 	float time_scale = 1.0f;
-
-	hexahedron::ColorScheme color_scheme = hexahedron::ColorScheme::PositionRGB;
-	bool mesh_dirty = false;
 
 	bool show_edges = true;
 	float edge_color[3] = { 0.02f, 0.02f, 0.02f };
@@ -223,11 +207,6 @@ struct Settings {
 	bool show_axes = true;
 	float grid_height = -3.0f;
 	float background[3] = { 0.015f, 0.017f, 0.024f };
-};
-
-struct PendingRelease {
-	graphics::Buffer buffer;
-	VkDescriptorSet descriptor_set;
 };
 
 constexpr uint32_t max_objects = 16;
@@ -238,7 +217,8 @@ constexpr int grid_half_size = 10;
 constexpr uint32_t max_line_vertices = 2048 + max_objects * path_segments * 2;
 constexpr float ground_thickness = 0.1f;
 
-constexpr uint32_t max_model_sets = 2 + max_objects;
+constexpr uint32_t ground_slot = max_objects;
+constexpr uint32_t world_slot = max_objects + 1;
 
 const float object_palette[][3] = {
 	{ 1.00f, 1.00f, 1.00f },
@@ -262,8 +242,10 @@ graphics::Buffer point_light_buffer;
 graphics::Buffer spot_light_buffer;
 VkDescriptorSet vk_scene_descriptor_set;
 
-graphics::Buffer world_uniform_buffer;
-VkDescriptorSet vk_world_descriptor_set;
+graphics::Buffer model_buffer;
+uint32_t model_stride;
+VkDescriptorSet model_set;
+Texture texture;
 
 graphics::Buffer vertex_buffer;
 graphics::Buffer triangle_index_buffer;
@@ -273,7 +255,6 @@ graphics::Buffer line_vertex_buffer;
 hexahedron::Mesh mesh;
 
 std::vector<SceneObject> objects;
-std::vector<PendingRelease> pending_releases;
 int selected_object = 0;
 int created_objects = 0;
 
@@ -328,12 +309,10 @@ void writeDescriptor(VkDescriptorSet set, uint32_t binding, VkDescriptorType typ
 	vkUpdateDescriptorSets(context.device, 1, &descriptor_write, 0, nullptr);
 }
 
-VkDescriptorSet allocateModelSet(const graphics::Buffer& buffer) {
-	VkDescriptorSet set = allocateDescriptorSet(vk_model_set_layout);
-	if (set != VK_NULL_HANDLE) {
-		writeDescriptor(set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, buffer, sizeof(ModelUniform));
-	}
-	return set;
+void bindModel(VkCommandBuffer cmd, uint32_t slot) {
+	const uint32_t offset = slot * model_stride;
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        1, 1, &model_set, 1, &offset);
 }
 
 SceneObject makeObject() {
@@ -357,8 +336,7 @@ SceneObject makeObject() {
 		.spin_speed = { 0.0f, 60.0f, 0.0f },
 		.orient_along_path = false,
 		.show_path = true,
-		.albedo = { color[0], color[1], color[2] },
-		.use_vertex_colors = true,
+		.path_color = { color[0], color[1], color[2] },
 		.specular = { 0.5f, 0.5f, 0.5f },
 		.shininess = 32.0f,
 		.t = 0.0f,
@@ -374,17 +352,6 @@ bool addObject(SceneObject object) {
 		return false;
 	}
 
-	if (!graphics::createBuffer(sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                            object.uniform_buffer)) {
-		return false;
-	}
-
-	object.descriptor_set = allocateModelSet(object.uniform_buffer);
-	if (object.descriptor_set == VK_NULL_HANDLE) {
-		graphics::destroyBuffer(object.uniform_buffer);
-		return false;
-	}
-
 	objects.push_back(object);
 	selected_object = int(objects.size()) - 1;
 
@@ -392,21 +359,8 @@ bool addObject(SceneObject object) {
 }
 
 void removeObject(int index) {
-	SceneObject& object = objects[size_t(index)];
-
-	pending_releases.push_back({ object.uniform_buffer, object.descriptor_set });
-
 	objects.erase(objects.begin() + index);
 	selected_object = std::clamp(selected_object, 0, std::max(0, int(objects.size()) - 1));
-}
-
-void releasePending() {
-	for (PendingRelease& release : pending_releases) {
-		vkFreeDescriptorSets(context.device, vk_descriptor_pool, 1, &release.descriptor_set);
-		graphics::destroyBuffer(release.buffer);
-	}
-
-	pending_releases.clear();
 }
 
 PointLight makePointLight() {
@@ -443,7 +397,7 @@ void createDefaultScene() {
 	knot.scale = { 0.6f, 0.6f, 0.6f };
 	knot.spin_speed = { 0.0f, 0.0f, 0.0f };
 	knot.orient_along_path = true;
-	knot.albedo[0] = 1.0f; knot.albedo[1] = 1.0f; knot.albedo[2] = 1.0f;
+	knot.path_color[0] = 1.0f; knot.path_color[1] = 1.0f; knot.path_color[2] = 1.0f;
 	addObject(knot);
 
 	SceneObject lissajous = makeObject();
@@ -457,8 +411,7 @@ void createDefaultScene() {
 	lissajous.scale = { 0.5f, 0.5f, 0.9f };
 	lissajous.uniform_scale = false;
 	lissajous.spin_speed = { 0.0f, 90.0f, 45.0f };
-	lissajous.albedo[0] = 1.0f; lissajous.albedo[1] = 0.55f; lissajous.albedo[2] = 0.25f;
-	lissajous.use_vertex_colors = false;
+	lissajous.path_color[0] = 1.0f; lissajous.path_color[1] = 0.55f; lissajous.path_color[2] = 0.25f;
 	addObject(lissajous);
 
 	selected_object = 0;
@@ -672,9 +625,9 @@ void buildLines() {
 		}
 
 		const math::Vector3 color = {
-			0.25f + 0.45f * object.albedo[0],
-			0.25f + 0.45f * object.albedo[1],
-			0.25f + 0.45f * object.albedo[2],
+			0.25f + 0.45f * object.path_color[0],
+			0.25f + 0.45f * object.path_color[1],
+			0.25f + 0.45f * object.path_color[2],
 		};
 
 		math::Vector3 previous = object.position + trajectoryPoint(object, 0.0f);
@@ -960,8 +913,7 @@ void objectEditorUI(SceneObject& object) {
 	ImGui::EndDisabled();
 
 	ImGui::SeparatorText("Материал");
-	ImGui::ColorEdit3("Альбедо (цвет фигуры)", object.albedo);
-	ImGui::Checkbox("Умножать на цвета вершин", &object.use_vertex_colors);
+	ImGui::ColorEdit3("Цвет траектории", object.path_color);
 	ImGui::ColorEdit3("Цвет блика", object.specular);
 	ImGui::SliderFloat("Коэффициент блика", &object.shininess, 1.0f, 256.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
 
@@ -1028,13 +980,6 @@ void displayUI() {
 		return;
 	}
 
-	int scheme = int(settings.color_scheme);
-	if (ImGui::Combo("Цвета вершин", &scheme, hexahedron::color_scheme_names,
-	                 int(hexahedron::ColorScheme::Count))) {
-		settings.color_scheme = hexahedron::ColorScheme(scheme);
-		settings.mesh_dirty = true;
-	}
-
 	ImGui::Checkbox("Рёбра", &settings.show_edges);
 	ImGui::SameLine();
 	ImGui::ColorEdit3("Цвет рёбер", settings.edge_color, ImGuiColorEditFlags_NoInputs);
@@ -1046,7 +991,6 @@ void displayUI() {
 	ImGui::ColorEdit3("Фон", settings.background, ImGuiColorEditFlags_NoInputs);
 
 	ImGui::SeparatorText("Материал пола");
-	ImGui::ColorEdit3("Альбедо##ground", ground.albedo);
 	ImGui::ColorEdit3("Цвет блика##ground", ground.specular);
 	ImGui::SliderFloat("Коэффициент блика##ground", &ground.shininess, 1.0f, 256.0f, "%.0f",
 	                   ImGuiSliderFlags_Logarithmic);
@@ -1104,7 +1048,7 @@ void drawUI() {
 	                        ImGuiCond_FirstUseEver);
 	ImGui::SetNextWindowSize(ImVec2(420.0f, viewport->WorkSize.y - 20.0f), ImGuiCond_FirstUseEver);
 
-	if (ImGui::Begin("Лабораторная работа №2")) {
+	if (ImGui::Begin("Лабораторная работа №3")) {
 		ImGui::PushItemWidth(-ImGui::GetFontSize() * 9.5f);
 
 		ImGui::Text("Вариант 12: правильный гексаэдр");
@@ -1149,9 +1093,15 @@ bool createResources() {
 	const VkDescriptorSetLayoutBinding model_bindings[] = {
 		{
 			.binding = 0,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 			.descriptorCount = 1,
 			.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		},
+		{
+			.binding = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			.descriptorCount = 1,
+			.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 		},
 	};
 
@@ -1180,18 +1130,10 @@ bool createResources() {
 		vk_model_set_layout,
 	};
 
-	const VkPushConstantRange push_constant_range = {
-		.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
-		.offset = 0,
-		.size = sizeof(PushConstants),
-	};
-
 	const VkPipelineLayoutCreateInfo pipeline_layout = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.setLayoutCount = sizeof(set_layouts) / sizeof(set_layouts[0]),
 		.pSetLayouts = set_layouts,
-		.pushConstantRangeCount = 1,
-		.pPushConstantRanges = &push_constant_range,
 	};
 
 	if (vkCreatePipelineLayout(context.device, &pipeline_layout, nullptr,
@@ -1231,8 +1173,8 @@ bool createResources() {
 			{
 				.location = 2,
 				.binding = 0,
-				.format = VK_FORMAT_R32G32B32_SFLOAT,
-				.offset = offsetof(Vertex, color),
+				.format = VK_FORMAT_R32G32_SFLOAT,
+				.offset = offsetof(Vertex, uv),
 			},
 		};
 
@@ -1291,9 +1233,11 @@ bool createResources() {
 	}
 
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
+		{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 },
+		{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-			.descriptorCount = 1 + max_model_sets,
+			.descriptorCount = 1,
 		},
 		{
 			.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -1303,8 +1247,7 @@ bool createResources() {
 
 	const VkDescriptorPoolCreateInfo descriptor_pool = {
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-		.maxSets = 1 + max_model_sets,
+		.maxSets = 2,
 		.poolSizeCount = sizeof(descriptor_pool_sizes) / sizeof(descriptor_pool_sizes[0]),
 		.pPoolSizes = descriptor_pool_sizes,
 	};
@@ -1336,46 +1279,36 @@ bool createResources() {
 	writeDescriptor(vk_scene_descriptor_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 	                spot_light_buffer, VK_WHOLE_SIZE);
 
-	if (!graphics::createBuffer(sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                            world_uniform_buffer) ||
-	    !graphics::createBuffer(sizeof(ModelUniform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-	                            ground.uniform_buffer)) {
-		return false;
-	}
-
-	vk_world_descriptor_set = allocateModelSet(world_uniform_buffer);
-	ground.descriptor_set = allocateModelSet(ground.uniform_buffer);
-	if (vk_world_descriptor_set == VK_NULL_HANDLE || ground.descriptor_set == VK_NULL_HANDLE) {
-		return false;
-	}
-
-	const ModelUniform world_uniforms = {
-		.model = math::Matrix4::identity(),
-		.albedo = { 1.0f, 1.0f, 1.0f },
-		.specular = { 0.0f, 0.0f, 0.0f },
-		.alpha = 1.0f,
-		.use_vertex_colors = 1.0f,
-	};
-	graphics::writeBuffer(world_uniform_buffer, &world_uniforms, sizeof(world_uniforms));
-
 	mesh = hexahedron::build(1.0f);
-	hexahedron::paint(mesh, settings.color_scheme);
-
-	const size_t vertices_size = mesh.vertices.size() * sizeof(Vertex);
-	const size_t triangles_size = mesh.triangles.size() * sizeof(uint32_t);
-	const size_t edges_size = mesh.edges.size() * sizeof(uint32_t);
-
-	if (!graphics::createBuffer(vertices_size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertex_buffer) ||
-	    !graphics::createBuffer(triangles_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, triangle_index_buffer) ||
-	    !graphics::createBuffer(edges_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, edge_index_buffer) ||
-	    !graphics::createBuffer(max_line_vertices * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-	                            line_vertex_buffer)) {
+	if (!uploadMeshAndTexture(mesh, vertex_buffer, triangle_index_buffer, edge_index_buffer, texture)) {
 		return false;
 	}
 
-	graphics::writeBuffer(vertex_buffer, mesh.vertices.data(), vertices_size);
-	graphics::writeBuffer(triangle_index_buffer, mesh.triangles.data(), triangles_size);
-	graphics::writeBuffer(edge_index_buffer, mesh.edges.data(), edges_size);
+	VkPhysicalDeviceProperties properties;
+	vkGetPhysicalDeviceProperties(context.physical_device, &properties);
+	const auto alignment = properties.limits.minUniformBufferOffsetAlignment;
+	model_stride = uint32_t((sizeof(ModelUniform) + alignment - 1) / alignment * alignment);
+
+	if (!graphics::createBuffer(model_stride * (world_slot + 1), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+	                            model_buffer) ||
+	    !graphics::createBuffer(max_line_vertices * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+	                            line_vertex_buffer)) return false;
+
+	model_set = allocateDescriptorSet(vk_model_set_layout);
+	if (!model_set) return false;
+	writeDescriptor(model_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, model_buffer, sizeof(ModelUniform));
+	const VkDescriptorImageInfo image = { texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+	const VkWriteDescriptorSet write = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = model_set,
+		.dstBinding = 1,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &image,
+	};
+	vkUpdateDescriptorSets(context.device, 1, &write, 0, nullptr);
+	const ModelUniform world = { .model = math::Matrix4::identity() };
+	graphics::writeBuffer(model_buffer, &world, sizeof(world), world_slot * model_stride);
 
 	return true;
 }
@@ -1398,22 +1331,14 @@ bool initialize() {
 void shutdown() {
 	vkQueueWaitIdle(context.graphics_queue);
 
-	for (PendingRelease& release : pending_releases) {
-		graphics::destroyBuffer(release.buffer);
-	}
-	pending_releases.clear();
-
-	for (SceneObject& object : objects) {
-		graphics::destroyBuffer(object.uniform_buffer);
-	}
 	objects.clear();
 
 	graphics::destroyBuffer(line_vertex_buffer);
 	graphics::destroyBuffer(edge_index_buffer);
 	graphics::destroyBuffer(triangle_index_buffer);
 	graphics::destroyBuffer(vertex_buffer);
-	graphics::destroyBuffer(ground.uniform_buffer);
-	graphics::destroyBuffer(world_uniform_buffer);
+	graphics::destroyBuffer(model_buffer);
+	destroyTexture(texture);
 	graphics::destroyBuffer(spot_light_buffer);
 	graphics::destroyBuffer(point_light_buffer);
 	graphics::destroyBuffer(scene_uniform_buffer);
@@ -1510,10 +1435,9 @@ void update(double time) {
 	for (SceneObject& object : objects) {
 		object.uniforms = {
 			.model = modelMatrix(object),
-			.albedo = { object.albedo[0], object.albedo[1], object.albedo[2] },
+			.line_color = { settings.edge_color[0], settings.edge_color[1], settings.edge_color[2], 1.0f },
 			.specular = { object.specular[0], object.specular[1], object.specular[2] },
 			.alpha = object.shininess,
-			.use_vertex_colors = object.use_vertex_colors ? 1.0f : 0.0f,
 		};
 	}
 
@@ -1521,10 +1445,8 @@ void update(double time) {
 	ground.uniforms = {
 		.model = math::Matrix4::translation({ 0.0f, settings.grid_height - ground_thickness * 0.5f, 0.0f }) *
 		         math::Matrix4::scale({ ground_size, ground_thickness, ground_size }),
-		.albedo = { ground.albedo[0], ground.albedo[1], ground.albedo[2] },
 		.specular = { ground.specular[0], ground.specular[1], ground.specular[2] },
 		.alpha = ground.shininess,
-		.use_vertex_colors = 0.0f,
 	};
 
 	buildLines();
@@ -1533,14 +1455,6 @@ void update(double time) {
 void render(const graphics::internal::FrameData& fd) {
 	if (fd.command_buffer == VK_NULL_HANDLE) {
 		return;
-	}
-
-	releasePending();
-
-	if (settings.mesh_dirty) {
-		hexahedron::paint(mesh, settings.color_scheme);
-		graphics::writeBuffer(vertex_buffer, mesh.vertices.data(), mesh.vertices.size() * sizeof(Vertex));
-		settings.mesh_dirty = false;
 	}
 
 	graphics::writeBuffer(scene_uniform_buffer, &scene_uniforms, sizeof(scene_uniforms));
@@ -1555,11 +1469,11 @@ void render(const graphics::internal::FrameData& fd) {
 		                      spot_light_data.size() * sizeof(SpotLightData));
 	}
 
-	for (const SceneObject& object : objects) {
-		graphics::writeBuffer(object.uniform_buffer, &object.uniforms, sizeof(object.uniforms));
+	for (size_t i = 0; i < objects.size(); ++i) {
+		graphics::writeBuffer(model_buffer, &objects[i].uniforms, sizeof(ModelUniform), i * model_stride);
 	}
 
-	graphics::writeBuffer(ground.uniform_buffer, &ground.uniforms, sizeof(ground.uniforms));
+	graphics::writeBuffer(model_buffer, &ground.uniforms, sizeof(ModelUniform), ground_slot * model_stride);
 
 	const uint32_t line_vertex_count = uint32_t(line_vertices.size());
 	if (line_vertex_count > 0) {
@@ -1615,44 +1529,28 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.buffer, &vertex_buffer_offset);
 	vkCmdBindIndexBuffer(cmd, triangle_index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-	for (const SceneObject& object : objects) {
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-		                        1, 1, &object.descriptor_set, 0, nullptr);
+	for (uint32_t i = 0; i < objects.size(); ++i) {
+		bindModel(cmd, i);
 		vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
 	}
 
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-	                        1, 1, &ground.descriptor_set, 0, nullptr);
+	bindModel(cmd, ground_slot);
 	vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_lines);
 
-	const PushConstants no_override = {};
-	vkCmdPushConstants(cmd, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-	                   0, sizeof(no_override), &no_override);
-
 	if (settings.show_edges) {
-		const PushConstants edge_override = {
-			.override_color = { settings.edge_color[0], settings.edge_color[1],
-			                    settings.edge_color[2], 1.0f },
-		};
-		vkCmdPushConstants(cmd, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-		                   0, sizeof(edge_override), &edge_override);
 		vkCmdBindIndexBuffer(cmd, edge_index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
-		for (const SceneObject& object : objects) {
-			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-			                        1, 1, &object.descriptor_set, 0, nullptr);
+		for (uint32_t i = 0; i < objects.size(); ++i) {
+			bindModel(cmd, i);
 			vkCmdDrawIndexed(cmd, uint32_t(mesh.edges.size()), 1, 0, 0, 0);
 		}
 
-		vkCmdPushConstants(cmd, vk_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-		                   0, sizeof(no_override), &no_override);
 	}
 
 	if (line_vertex_count > 0) {
-		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-		                        1, 1, &vk_world_descriptor_set, 0, nullptr);
+		bindModel(cmd, world_slot);
 		vkCmdBindVertexBuffers(cmd, 0, 1, &line_vertex_buffer.buffer, &vertex_buffer_offset);
 		vkCmdDraw(cmd, line_vertex_count, 1, 0, 0);
 	}

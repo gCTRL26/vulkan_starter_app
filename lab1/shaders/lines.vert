@@ -11,19 +11,13 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 
 layout(std140, set = 1, binding = 0) uniform ModelUniform {
 	mat4 model;
-	vec3 albedo;
+	vec4 line_color;
 	vec3 specular;
 	float alpha;
-	float use_vertex_colors;
 } model_uniforms;
-
-layout(push_constant) uniform PushConstants {
-	vec4 override_color;
-} push_constants;
 
 void main() {
 	gl_Position = scene_uniforms.view_projection * model_uniforms.model * vec4(in_position, 1.0);
 
-	vec3 color = model_uniforms.albedo * mix(vec3(1.0), in_color, model_uniforms.use_vertex_colors);
-	out_color = mix(color, push_constants.override_color.rgb, push_constants.override_color.a);
+	out_color = mix(in_color, model_uniforms.line_color.rgb, model_uniforms.line_color.a);
 }
