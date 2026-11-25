@@ -1,15 +1,15 @@
-# Лабораторная работа №3. Текстурирование
+# Лабораторная работа №4. Наложение теней
 
 ## Сборка и запуск
 
-Нужны Vulkan SDK (с `glslc`), CMake 3.20+, Ninja, компилятор с поддержкой C++20 и git — CMake сам скачивает GLFW, vk-bootstrap, VulkanMemoryAllocator ImGui и LodePNG.
+Нужны Vulkan 1.3 с поддержкой динамического рендеринга, Vulkan SDK (с `glslc`), CMake 3.20+, Ninja, компилятор с поддержкой C++20 и git — CMake сам скачивает GLFW, vk-bootstrap, VulkanMemoryAllocator ImGui и LodePNG.
 
 Из корня проекта:
 
 ```bash
 cmake --preset release
 cmake --build build-release --parallel
-./build-release/cg-lab3.exe
+./build-release/cg-lab4.exe
 ```
 
 Для отладочной сборки вместо `release` пишется `debug`. Под Visual Studio 2022 — пресет `msvc-release`, исполняемый файл будет в `build-release/Release/`.
@@ -17,6 +17,8 @@ cmake --build build-release --parallel
 Шейдеры из `shaders/` компилируются в SPIR-V при сборке автоматически.
 
 ## Структура
+
+- `source/shadow.cpp`, `shaders/shadow.vert` — карта глубины и отрисовка сцены со стороны солнца;
 
 - `textures/checker.png` — текстура альбедо;
 - `source/texture.cpp` — загрузка PNG и перенос текстуры и геометрии в видеопамять;

@@ -97,6 +97,7 @@ VkShaderModule loadShaderModule(const char* file_name) {
 }
 
 VkPipeline createGraphicsPipeline(const PipelineDescription& description) {
+	const bool shadow = description.shadow_depth_format != VK_FORMAT_UNDEFINED;
 	const VkPipelineShaderStageCreateInfo stage_infos[] = {
 		{
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -171,17 +172,23 @@ VkPipeline createGraphicsPipeline(const PipelineDescription& description) {
 	const VkDynamicState dynamic_states[] = {
 		VK_DYNAMIC_STATE_VIEWPORT,
 		VK_DYNAMIC_STATE_SCISSOR,
+		VK_DYNAMIC_STATE_DEPTH_BIAS,
 	};
 
 	const VkPipelineDynamicStateCreateInfo dynamic_state = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-		.dynamicStateCount = sizeof(dynamic_states) / sizeof(dynamic_states[0]),
+		.dynamicStateCount = shadow ? 3u : 2u,
 		.pDynamicStates = dynamic_states,
 	};
 
+	const VkPipelineRenderingCreateInfo rendering = {
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+		.depthAttachmentFormat = description.shadow_depth_format,
+	};
 	const VkGraphicsPipelineCreateInfo pipeline_info = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-		.stageCount = sizeof(stage_infos) / sizeof(stage_infos[0]),
+		.pNext = shadow ? &rendering : nullptr,
+		.stageCount = shadow ? 1u : 2u,
 		.pStages = stage_infos,
 		.pVertexInputState = &input_state_info,
 		.pInputAssemblyState = &assembly_state_info,
@@ -189,10 +196,10 @@ VkPipeline createGraphicsPipeline(const PipelineDescription& description) {
 		.pRasterizationState = &raster_info,
 		.pMultisampleState = &sample_info,
 		.pDepthStencilState = &depth_info,
-		.pColorBlendState = &blend_info,
+		.pColorBlendState = shadow ? nullptr : &blend_info,
 		.pDynamicState = &dynamic_state,
 		.layout = description.layout,
-		.renderPass = context.render_pass,
+		.renderPass = shadow ? VK_NULL_HANDLE : context.render_pass,
 		.subpass = 0,
 	};
 

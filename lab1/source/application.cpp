@@ -12,6 +12,7 @@
 
 #include "graphics.hpp"
 #include "texture.hpp"
+#include "shadow.hpp"
 #include "hexahedron.hpp"
 #include "math.hpp"
 
@@ -23,6 +24,7 @@ using graphics::internal::context;
 
 struct SceneUniforms {
 	math::Matrix4 view_projection;
+	math::Matrix4 shadow_projection;
 	float camera_position[3];
 	float padding0;
 	float directional_light_direction[3];
@@ -60,10 +62,10 @@ struct SpotLightData {
 	float padding2[3];
 };
 
-static_assert(offsetof(SceneUniforms, camera_position) == 64);
-static_assert(offsetof(SceneUniforms, ambient_light) == 112);
-static_assert(offsetof(SceneUniforms, point_light_count) == 124);
-static_assert(offsetof(SceneUniforms, spot_light_count) == 128);
+static_assert(offsetof(SceneUniforms, camera_position) == 128);
+static_assert(offsetof(SceneUniforms, ambient_light) == 176);
+static_assert(offsetof(SceneUniforms, point_light_count) == 188);
+static_assert(offsetof(SceneUniforms, spot_light_count) == 192);
 static_assert(offsetof(ModelUniform, specular) == 80);
 static_assert(offsetof(ModelUniform, alpha) == 92);
 static_assert(sizeof(ModelUniform) == 96);
@@ -185,6 +187,8 @@ struct Lighting {
 	math::Vector3 directional_direction = { -0.4f, -1.0f, -0.3f };
 	float directional_color[3] = { 1.0f, 0.96f, 0.9f };
 	float directional_intensity = 0.4f;
+	float shadow_width = 24.0f;
+	float shadow_bias = 1.25f;
 
 	std::vector<PointLight> point_lights;
 	std::vector<SpotLight> spot_lights;
@@ -246,6 +250,8 @@ graphics::Buffer model_buffer;
 uint32_t model_stride;
 VkDescriptorSet model_set;
 Texture texture;
+ShadowMap shadow_map;
+VkPipeline vk_shadow_pipeline;
 
 graphics::Buffer vertex_buffer;
 graphics::Buffer triangle_index_buffer;
@@ -747,6 +753,8 @@ void lightingUI() {
 	ImGui::DragFloat3("Направление##directional", &lighting.directional_direction.x, 0.01f, -1.0f, 1.0f, "%.2f");
 	ImGui::ColorEdit3("Цвет##directional", lighting.directional_color);
 	ImGui::SliderFloat("Интенсивность##directional", &lighting.directional_intensity, 0.0f, 3.0f, "%.2f");
+	ImGui::SliderFloat("Ширина области тени", &lighting.shadow_width, 2.0f, 64.0f, "%.1f");
+	ImGui::SliderFloat("Смещение глубины", &lighting.shadow_bias, 0.0f, 16.0f, "%.2f");
 
 	ImGui::SeparatorText("Точечные источники");
 
@@ -1048,7 +1056,7 @@ void drawUI() {
 	                        ImGuiCond_FirstUseEver);
 	ImGui::SetNextWindowSize(ImVec2(420.0f, viewport->WorkSize.y - 20.0f), ImGuiCond_FirstUseEver);
 
-	if (ImGui::Begin("Лабораторная работа №3")) {
+	if (ImGui::Begin("Лабораторная работа №4")) {
 		ImGui::PushItemWidth(-ImGui::GetFontSize() * 9.5f);
 
 		ImGui::Text("Вариант 12: правильный гексаэдр");
@@ -1068,8 +1076,32 @@ void drawUI() {
 	statusOverlay();
 }
 
+void drawModels(VkCommandBuffer cmd, VkPipeline pipeline) {
+	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
+	                        0, 1, &vk_scene_descriptor_set, 0, nullptr);
+
+	const VkDeviceSize vertex_buffer_offset = 0;
+
+	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+	vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.buffer, &vertex_buffer_offset);
+	vkCmdBindIndexBuffer(cmd, triangle_index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+	for (uint32_t i = 0; i < objects.size(); ++i) {
+		bindModel(cmd, i);
+		vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
+	}
+
+	bindModel(cmd, ground_slot);
+	vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
+}
+
 bool createResources() {
+	if (!createShadowMap(shadow_map)) {
+		std::cerr << "Failed to create shadow map\n";
+		return false;
+	}
 	const VkDescriptorSetLayoutBinding scene_bindings[] = {
+		{ 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
 		{
 			.binding = 0,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -1142,12 +1174,13 @@ bool createResources() {
 		return false;
 	}
 
+	VkShaderModule shadow_shader = graphics::loadShaderModule("shadow.vert.spv");
 	VkShaderModule scene_vertex_shader = graphics::loadShaderModule("scene.vert.spv");
 	VkShaderModule scene_fragment_shader = graphics::loadShaderModule("scene.frag.spv");
 	VkShaderModule lines_vertex_shader = graphics::loadShaderModule("lines.vert.spv");
 	VkShaderModule lines_fragment_shader = graphics::loadShaderModule("lines.frag.spv");
 
-	if (scene_vertex_shader != VK_NULL_HANDLE && scene_fragment_shader != VK_NULL_HANDLE &&
+	if (shadow_shader != VK_NULL_HANDLE && scene_vertex_shader != VK_NULL_HANDLE && scene_fragment_shader != VK_NULL_HANDLE &&
 	    lines_vertex_shader != VK_NULL_HANDLE && lines_fragment_shader != VK_NULL_HANDLE) {
 		const VkVertexInputBindingDescription vertex_bindings[] = {
 			{
@@ -1219,22 +1252,29 @@ bool createResources() {
 			.depth_bias = false,
 		};
 
+		graphics::PipelineDescription shadow_pipeline = lit_pipeline;
+		shadow_pipeline.vertex_shader = shadow_shader;
+		shadow_pipeline.fragment_shader = VK_NULL_HANDLE;
+		shadow_pipeline.vertex_attribute_count = 1;
+		shadow_pipeline.shadow_depth_format = shadow_map.format;
+		vk_shadow_pipeline = graphics::createGraphicsPipeline(shadow_pipeline);
 		vk_pipeline_lit = graphics::createGraphicsPipeline(lit_pipeline);
 		vk_pipeline_lines = graphics::createGraphicsPipeline(lines_pipeline);
 	}
 
+	vkDestroyShaderModule(context.device, shadow_shader, nullptr);
 	vkDestroyShaderModule(context.device, scene_vertex_shader, nullptr);
 	vkDestroyShaderModule(context.device, scene_fragment_shader, nullptr);
 	vkDestroyShaderModule(context.device, lines_vertex_shader, nullptr);
 	vkDestroyShaderModule(context.device, lines_fragment_shader, nullptr);
 
-	if (vk_pipeline_lit == VK_NULL_HANDLE || vk_pipeline_lines == VK_NULL_HANDLE) {
+	if (vk_shadow_pipeline == VK_NULL_HANDLE || vk_pipeline_lit == VK_NULL_HANDLE || vk_pipeline_lines == VK_NULL_HANDLE) {
 		return false;
 	}
 
 	const VkDescriptorPoolSize descriptor_pool_sizes[] = {
 		{ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 },
-		{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
+		{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 },
 		{
 			.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
 			.descriptorCount = 1,
@@ -1278,6 +1318,19 @@ bool createResources() {
 	                point_light_buffer, VK_WHOLE_SIZE);
 	writeDescriptor(vk_scene_descriptor_set, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
 	                spot_light_buffer, VK_WHOLE_SIZE);
+
+	const VkDescriptorImageInfo depth = {
+		shadow_map.depth.sampler, shadow_map.depth.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+	};
+	const VkWriteDescriptorSet write_shadow = {
+		.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+		.dstSet = vk_scene_descriptor_set,
+		.dstBinding = 3,
+		.descriptorCount = 1,
+		.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+		.pImageInfo = &depth,
+	};
+	vkUpdateDescriptorSets(context.device, 1, &write_shadow, 0, nullptr);
 
 	mesh = hexahedron::build(1.0f);
 	if (!uploadMeshAndTexture(mesh, vertex_buffer, triangle_index_buffer, edge_index_buffer, texture)) {
@@ -1339,6 +1392,7 @@ void shutdown() {
 	graphics::destroyBuffer(vertex_buffer);
 	graphics::destroyBuffer(model_buffer);
 	destroyTexture(texture);
+	destroyTexture(shadow_map.depth);
 	graphics::destroyBuffer(spot_light_buffer);
 	graphics::destroyBuffer(point_light_buffer);
 	graphics::destroyBuffer(scene_uniform_buffer);
@@ -1346,6 +1400,7 @@ void shutdown() {
 	vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
 	vkDestroyPipeline(context.device, vk_pipeline_lines, nullptr);
 	vkDestroyPipeline(context.device, vk_pipeline_lit, nullptr);
+	vkDestroyPipeline(context.device, vk_shadow_pipeline, nullptr);
 	vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, vk_model_set_layout, nullptr);
 	vkDestroyDescriptorSetLayout(context.device, vk_scene_set_layout, nullptr);
@@ -1400,8 +1455,14 @@ void update(double time) {
 	const float di = lighting.directional_intensity;
 	const float ai = lighting.ambient_intensity;
 
+	const float half_width = lighting.shadow_width * 0.5f;
+	const math::Vector3 up = std::abs(directional.y) > 0.99f ? math::Vector3{0, 0, 1} : math::Vector3{0, 1, 0};
+	const auto sun_view = math::Matrix4::lookAt(directional * -32.0f, {0, 0, 0}, up);
+	const auto sun_projection = math::Matrix4::orthographic(-half_width, half_width, -half_width, half_width, 0.0f, 64.0f);
+
 	scene_uniforms = {
 		.view_projection = projection_matrix * view_matrix,
+		.shadow_projection = sun_projection * sun_view,
 		.camera_position = { camera.position.x, camera.position.y, camera.position.z },
 		.directional_light_direction = { directional.x, directional.y, directional.z },
 		.directional_light_color = { dc[0] * di, dc[1] * di, dc[2] * di },
@@ -1491,6 +1552,10 @@ void render(const graphics::internal::FrameData& fd) {
 
 	vkBeginCommandBuffer(cmd, &command_buffer_begin);
 
+	beginShadowPass(cmd, shadow_map, lighting.shadow_bias);
+	drawModels(cmd, vk_shadow_pipeline);
+	endShadowPass(cmd, shadow_map);
+
 	const VkClearValue clear_values[] = {
 		{ .color = { .float32 = { settings.background[0], settings.background[1],
 		                          settings.background[2], 1.0f } } },
@@ -1520,22 +1585,8 @@ void render(const graphics::internal::FrameData& fd) {
 	vkCmdSetViewport(cmd, 0, 1, &viewport);
 	vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_layout,
-	                        0, 1, &vk_scene_descriptor_set, 0, nullptr);
-
+	drawModels(cmd, vk_pipeline_lit);
 	const VkDeviceSize vertex_buffer_offset = 0;
-
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_lit);
-	vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.buffer, &vertex_buffer_offset);
-	vkCmdBindIndexBuffer(cmd, triangle_index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-
-	for (uint32_t i = 0; i < objects.size(); ++i) {
-		bindModel(cmd, i);
-		vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
-	}
-
-	bindModel(cmd, ground_slot);
-	vkCmdDrawIndexed(cmd, uint32_t(mesh.triangles.size()), 1, 0, 0, 0);
 
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline_lines);
 

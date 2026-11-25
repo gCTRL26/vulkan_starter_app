@@ -1,12 +1,13 @@
 cmake_minimum_required(VERSION 3.20)
 include(FetchContent)
 
-project(cg-lab3 LANGUAGES C CXX)
+project(cg-lab4 LANGUAGES C CXX)
 
 add_executable(${PROJECT_NAME}
 	source/main.cpp
 	source/graphics_internal.cpp
 	source/texture.cpp
+	source/shadow.cpp
 	source/graphics.cpp
 	source/hexahedron.cpp
 	source/application.cpp
@@ -120,6 +121,7 @@ macro(compile_shader SHADER_FILE)
 	list(APPEND _SHADER_BINARIES ${SHADER_BINARY_PATH})
 endmacro()
 
+compile_shader(shadow.vert)
 compile_shader(scene.vert)
 compile_shader(scene.frag)
 compile_shader(lines.vert)

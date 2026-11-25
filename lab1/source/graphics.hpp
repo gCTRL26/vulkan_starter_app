@@ -36,6 +36,7 @@ struct PipelineDescription {
 	VkPrimitiveTopology topology;
 	VkCullModeFlags cull_mode;
 	bool depth_bias;
+	VkFormat shadow_depth_format = VK_FORMAT_UNDEFINED;
 };
 
 VkPipeline createGraphicsPipeline(const PipelineDescription& description);

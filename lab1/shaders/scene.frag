@@ -3,6 +3,8 @@
 layout(location = 0) in vec3 in_position;
 layout(location = 1) in vec3 in_normal;
 layout(location = 2) in vec2 in_uv;
+layout(location = 3) in vec4 in_shadow_position;
+layout(set = 0, binding = 3) uniform sampler2DShadow shadow_map;
 
 layout(set = 1, binding = 1) uniform sampler2D albedo_texture;
 
@@ -23,6 +25,7 @@ struct SpotLight {
 
 layout(std140, set = 0, binding = 0) uniform SceneUniforms {
 	mat4 view_projection;
+	mat4 shadow_projection;
 	vec3 camera_position;
 	vec3 directional_light_direction;
 	vec3 directional_light_color;
@@ -61,7 +64,12 @@ void main() {
 
 	vec3 color = scene_uniforms.ambient_light * albedo;
 
-	color += blinnPhong(n, v, normalize(-scene_uniforms.directional_light_direction),
+	vec3 shadow = in_shadow_position.xyz / in_shadow_position.w;
+	shadow.xy = shadow.xy * 0.5 + 0.5;
+	float visibility = 1.0;
+	if (shadow.z >= 0.0 && shadow.z < 1.0)
+		visibility = texture(shadow_map, shadow);
+	color += visibility * blinnPhong(n, v, normalize(-scene_uniforms.directional_light_direction),
 	                    scene_uniforms.directional_light_color, albedo);
 
 	for (uint i = 0; i < scene_uniforms.point_light_count; ++i) {
